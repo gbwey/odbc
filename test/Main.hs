@@ -101,7 +101,8 @@ regressions = do
   it
     "Internal.exec can return SQL_NO_DATA"
     (do c <- connectWithString
-        Internal.exec c "DROP TABLE IF EXISTS wibble"
+        -- Internal.exec c "DROP TABLE IF EXISTS wibble"
+        Internal.exec c "IF OBJECT_ID('dbo.wibble', 'U') IS NOT NULL DROP TABLE wibble"
         Internal.exec c "CREATE TABLE wibble (i integer)"
         Internal.exec c "DELETE FROM wibble"
         Internal.close c)
@@ -193,7 +194,8 @@ dataRetrieval = do
   it
     "Basic sanity check"
     (do c <- connectWithString
-        Internal.exec c "DROP TABLE IF EXISTS test"
+        --Internal.exec c "DROP TABLE IF EXISTS test"
+        Internal.exec c "IF OBJECT_ID('dbo.test', 'U') IS NOT NULL DROP TABLE test"
         Internal.exec
           c
           "CREATE TABLE test (int integer, text text, bool bit, nt ntext, fl float)"
@@ -221,11 +223,14 @@ dataRetrieval = do
   it
     "Querying commands with no results"
     (do c <- connectWithString
-        rows1 <- Internal.query c "DROP TABLE IF EXISTS no_such_table"
+--        rows1 <- Internal.query c "DROP TABLE IF EXISTS no_such_table"
+        rows1 <- Internal.query c "IF OBJECT_ID('dbo.no_such_table', 'U') IS NOT NULL DROP TABLE no_such_table"
+
         rows2 <-
           Internal.stream
             c
-            "DROP TABLE IF EXISTS no_such_table"
+            -- "DROP TABLE IF EXISTS no_such_table"
+            "IF OBJECT_ID('dbo.no_such_table', 'U') IS NOT NULL DROP TABLE no_such_table"
             (\s _ -> pure (Stop s))
             []
         shouldBe (rows1 ++ rows2) [])
@@ -295,7 +300,8 @@ roundtrip why l typ input =
   it
     ("Roundtrip " <> why <> ": HS=" <> l <> ", SQL=" <> typ)
     (do c <- connectWithString
-        SQLServer.exec c "DROP TABLE IF EXISTS test"
+        --SQLServer.exec c "DROP TABLE IF EXISTS test"
+        SQLServer.exec c "IF OBJECT_ID('dbo.test', 'U') IS NOT NULL DROP TABLE test"
         SQLServer.exec c ("CREATE TABLE test (f " <> fromString typ <> ")")
         let q = "INSERT INTO test VALUES (" <> toSql (input) <> ")"
         SQLServer.exec c q
@@ -320,7 +326,8 @@ quickCheckRoundtripEx ::
 quickCheckRoundtripEx testMaybes l typ =
   beforeAll
     (do c <- connectWithString
-        SQLServer.exec c "DROP TABLE IF EXISTS test"
+        --SQLServer.exec c "DROP TABLE IF EXISTS test"
+        SQLServer.exec c "IF OBJECT_ID('dbo.test', 'U') IS NOT NULL DROP TABLE test"
         SQLServer.exec c ("CREATE TABLE test (f " <> fromString typ <> ")")
         pure c)
     (afterAll
@@ -394,7 +401,8 @@ quickCheckOneway ::
 quickCheckOneway l typ =
   beforeAll
     (do c <- connectWithString
-        SQLServer.exec c "DROP TABLE IF EXISTS test"
+        -- SQLServer.exec c "DROP TABLE IF EXISTS test"
+        SQLServer.exec c "IF OBJECT_ID('dbo.test', 'U') IS NOT NULL DROP TABLE test"
         SQLServer.exec c ("CREATE TABLE test (f " <> fromString typ <> ")")
         pure c)
     (afterAll
@@ -439,7 +447,8 @@ quickCheckInternalRoundtrip ::
 quickCheckInternalRoundtrip hstype typ shower unpack =
   beforeAll
     (do c <- connectWithString
-        Internal.exec c "DROP TABLE IF EXISTS test"
+--        Internal.exec c "DROP TABLE IF EXISTS test"
+        Internal.exec c "IF OBJECT_ID('dbo.test', 'U') IS NOT NULL DROP TABLE test"
         Internal.exec c ("CREATE TABLE test (f " <> typ <> ")")
         pure c)
     (afterAll

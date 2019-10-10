@@ -82,7 +82,7 @@ connectWithString = do
         "Need ODBC_TEST_CONNECTION_STRING environment variable.\n\
         \Example:\n\
         \ODBC_TEST_CONNECTION_STRING='DRIVER={ODBC Driver 13 for SQL Server};SERVER=127.0.0.1;Uid=SA;Pwd=Passw0rd;Encrypt=no'"
-    Just connStr -> Internal.connect (T.pack connStr)
+    Just connStr -> Internal.connectAuto (T.pack connStr)
 
 -- | I had trouble passing in environment variables via Docker on
 -- Travis without the value coming in with quotes around it.

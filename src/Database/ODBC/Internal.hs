@@ -10,6 +10,7 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | ODBC database API.
 --
@@ -21,14 +22,18 @@
 -- Don't use this module if you don't know what you're doing.
 
 module Database.ODBC.Internal
+{-
   ( -- * Connect/disconnect
-    connect
+    connectAuto
+  , connectManual
   , close
-  , withConnection
+  , withConnectionAuto
+  , withConnectionManual
   , Connection
     -- * Executing queries
   , exec
   , query
+  , queryAll
   , Value(..)
   , Binary(..)
     -- * Streaming results
@@ -36,7 +41,9 @@ module Database.ODBC.Internal
   , Step(..)
     -- * Exceptions
   , ODBCException(..)
-  ) where
+  , Column (..)
+  , ResultSets
+  ) -} where
 
 import           Control.Concurrent.Async
 import           Control.Concurrent.MVar
@@ -58,7 +65,8 @@ import           Data.Time
 import           Foreign hiding (void)
 import           Foreign.C
 import           GHC.Generics
-
+import           qualified UnliftIO.Exception as UE
+import qualified Conduit as C
 --------------------------------------------------------------------------------
 -- Public types
 
@@ -90,6 +98,9 @@ data ODBCException
   | DataRetrievalError !String
     -- ^ There was a general error retrieving data. String will
     -- contain the reason why.
+  | ParameterMismatch !String
+  | ParseSqlError !String
+  | SqlFailedError !Text !ODBCException
   deriving (Typeable, Show, Eq)
 instance Exception ODBCException
 
@@ -149,11 +160,14 @@ data Step a
 
 -- | A column description.
 data Column = Column
-  { columnType :: !SQLSMALLINT
-  , columnSize :: !SQLULEN
-  , columnDigits :: !SQLSMALLINT
-  , columnNull :: !SQLSMALLINT
-  } deriving (Show)
+  { columnName :: !Text
+  , columnType :: !Int
+  , columnSize :: !Int
+  , columnDigits :: !Int
+  , columnNull :: !Bool
+  } deriving (Show,Generic,Eq)
+
+instance NFData Column
 
 --------------------------------------------------------------------------------
 -- Exposed functions
@@ -214,13 +228,45 @@ close conn =
 
 
 -- | Memory bracket around 'connect' and 'close'.
-withConnection :: MonadUnliftIO m =>
+withConnectionAuto :: MonadUnliftIO m =>
                Text  -- ^ An ODBC connection string.
             -> (Connection -> m a) -- ^ Program that uses the ODBC connection.
             -> m a
-withConnection str inner = withRunInIO $ \io ->
-  withBound $ bracket (connect str) close (\h -> io (inner h))
+withConnectionAuto str inner = withRunInIO $ \io ->
+  withBound $ bracket (connectAuto str) close (\h -> io (inner h))
 
+withConnectionManual :: MonadUnliftIO m =>
+               Text  -- ^ An ODBC connection string.
+            -> (Connection -> m a) -- ^ Program that uses the ODBC connection.
+            -> m a
+withConnectionManual str inner = withRunInIO $ \io ->
+  withBound $ bracket (connectManual str) close $ \c -> do
+      r <- UE.onException (io $ inner c) $ UE.catch (io $ rollback c) (\(_ :: UE.SomeException) -> return ())
+      io $ commit c
+      return r
+        -- Discard any exception from (rollback conn) so original
+        -- exception can be re-raised
+
+
+
+
+data AutoCommit = Auto | Manual deriving (Show, Eq, Generic)
+-- | Connect using the given connection string.
+
+connectManual ::
+     MonadIO m
+  => Text -- ^ An ODBC connection string.
+  -> m Connection
+connectManual string = do
+  c <- connect string
+  setAutoCommitOff c
+  return c
+
+connectAuto ::
+     MonadIO m
+  => Text -- ^ An ODBC connection string.
+  -> m Connection
+connectAuto = connect
 
 -- | Execute a statement on the database.
 exec ::
@@ -250,6 +296,22 @@ query conn string =
        conn
        "query"
        (\dbc -> withExecDirect dbc string (fetchStatementRows dbc)))
+
+-- | Query and return a list of rows.
+queryAll ::
+     MonadIO m
+  => Connection -- ^ A connection to the database.
+  -> Text -- ^ SQL query.
+  -> m ResultSets
+  -- ^ A strict list of rows. This list is not lazy, so if you are
+  -- retrieving a large data set, be aware that all of it will be
+  -- loaded into memory.
+queryAll conn string =
+  withBound
+    (withHDBC
+       conn
+       "queryall"
+       (\dbc -> withExecDirect dbc string (fetchStatementAll dbc)))
 
 -- | Stream results like a fold with the option to stop at any time.
 stream ::
@@ -371,6 +433,48 @@ fetchIterator dbc (UnliftIO runInIO) step state0 stmt = do
     then loop state0
     else pure state0
 
+
+-- | Iterate over the rows in the statement.
+fetchConduit ::
+     Ptr EnvAndDbc
+  -> SQLHSTMT s
+  -> C.ConduitT () [Value] IO ()
+fetchConduit dbc stmt = do
+  SQLSMALLINT cols <-
+    liftIO
+      (withMalloc
+         (\sizep -> do
+            assertSuccess
+              dbc
+              "odbc_SQLNumResultCols"
+              (odbc_SQLNumResultCols stmt sizep)
+            peek sizep))
+  types <- liftIO $ mapM (describeColumn dbc stmt) [1 .. cols]
+  let loop :: C.ConduitT () [Value] IO ()
+      loop = do
+        do retcode0 <- liftIO $ odbc_SQLFetch dbc stmt
+           if | retcode0 == sql_no_data ->
+                do retcode <- liftIO $ odbc_SQLMoreResults dbc stmt
+                   if retcode == sql_success || retcode == sql_success_with_info
+                     then loop
+                     else pure ()
+              | retcode0 == sql_success || retcode0 == sql_success_with_info ->
+                do row <- liftIO $
+                     sequence
+                       (zipWith (getData dbc stmt) [SQLUSMALLINT 1 ..] types)
+                   (C.yield row)
+                   loop
+              | otherwise ->
+                liftIO $ throwIO
+                  (UnsuccessfulReturnCode
+                     "odbc_SQLFetch"
+                     (coerce retcode0)
+                     "Unexpected return code")
+  if cols > 0
+    then loop
+    else pure ()
+
+
 -- | Fetch all results from possible multiple statements.
 fetchAllResults :: Ptr EnvAndDbc -> SQLHSTMT s -> IO ()
 fetchAllResults dbc stmt = do
@@ -382,6 +486,173 @@ fetchAllResults dbc stmt = do
   when
     (retcode == sql_success || retcode == sql_success_with_info)
     (fetchAllResults dbc stmt)
+
+commit ::
+     MonadIO m
+  => Connection -- ^ A connection to the database.
+  -> m ()
+commit conn =
+  withBound
+    (withHDBC
+       conn
+       "commitI"
+       (\dbc -> commitI dbc))
+
+rollback ::
+     MonadIO m
+  => Connection -- ^ A connection to the database.
+  -> m ()
+rollback conn =
+  withBound
+    (withHDBC
+       conn
+       "rollbackI"
+       (\dbc -> rollbackI dbc))
+
+commitI :: Ptr EnvAndDbc -> IO ()
+commitI dbc =
+  assertSuccess
+   dbc
+   "odbc_GBCommit"
+   (odbc_GBCommit dbc)
+
+rollbackI :: Ptr EnvAndDbc -> IO ()
+rollbackI dbc =
+  assertSuccess
+   dbc
+   "odbc_GBRollback"
+   (odbc_GBRollback dbc)
+
+
+setAutoCommitOn ::
+     MonadIO m
+  => Connection
+  -> m ()
+setAutoCommitOn conn =
+  withBound
+    (withHDBC
+       conn
+       "setCommitOnI"
+       (\dbc -> setAutoCommitOnI dbc))
+
+setAutoCommitOnI :: Ptr EnvAndDbc -> IO ()
+setAutoCommitOnI dbc =
+  assertSuccess
+   dbc
+   "odbc_GBSetAutoCommitOn"
+   (odbc_GBSetAutoCommitOn dbc)
+
+
+setAutoCommitOff ::
+     MonadIO m
+  => Connection
+  -> m ()
+setAutoCommitOff conn =
+  withBound
+    (withHDBC
+       conn
+       "setCommitOffI"
+       (\dbc -> setAutoCommitOffI dbc))
+
+setAutoCommitOffI :: Ptr EnvAndDbc -> IO ()
+setAutoCommitOffI dbc =
+  assertSuccess
+   dbc
+   "odbc_GBSetAutoCommitOff"
+   (odbc_GBSetAutoCommitOff dbc)
+
+getAutoCommitState ::
+     MonadIO m
+  => Connection
+  -> m Int
+getAutoCommitState conn = do
+  SQLINTEGER ret <- withBound
+   (withHDBC
+      conn
+      "getAutoCommitState"
+      (\dbc -> getAutoCommitStateI dbc))
+  return $ fromIntegral ret
+
+getAutoCommitStateI :: Ptr EnvAndDbc -> IO SQLINTEGER
+getAutoCommitStateI dbc =
+  withMalloc
+     (\sizep -> do
+        assertSuccess
+          dbc
+          "odbc_GBGetAutoCommitState"
+          (odbc_GBGetAutoCommitState dbc sizep)
+        peek sizep)
+
+
+-- | Fetch all rows from a statement.
+type ResultSets = [ResultSet] -- Either Int ([Column], [[Value]])]
+type RMeta = [Column]
+--type ResultSet = Either Int ([Column], [[Value]])
+
+data ResultSet = RUpd !Int | RDdl | RData [Column] [[Value]] deriving (Show, Eq, Generic)
+instance NFData ResultSet
+
+fetchStatementAll :: Ptr EnvAndDbc -> SQLHSTMT s -> IO ResultSets
+fetchStatementAll dbc stmt = do
+  let loop :: (ResultSets -> ResultSets) -> IO ResultSets
+      loop rows = do
+             SQLSMALLINT cols <-
+               withMalloc
+                (\sizep -> do
+                   assertSuccess
+                     dbc
+                     "odbc_SQLNumResultCols"
+                     (odbc_SQLNumResultCols stmt sizep)
+                   peek sizep)
+
+             types <- mapM (describeColumn dbc stmt) [1 .. cols]
+
+             if cols == 0 then do -- could be either an empty data resultset or a retcode
+                SQLLEN cnt <-
+                  withMalloc
+                    (\sizep -> do
+                       assertSuccess
+                         dbc
+                         "odbc_SQLRowCount"
+                         (odbc_SQLRowCount stmt sizep)
+                       peek sizep)
+                -- putStrLn $ "fetchStatementAll: cnt=" ++ show cnt
+                if cnt /= -1 then do
+                  retcode <- odbc_SQLMoreResults dbc stmt
+--                  putStrLn $ "fetchStatementAll: cnt=" ++ show cnt ++ " retcode=" ++ show retcode
+                  if retcode == sql_success || retcode == sql_success_with_info then do
+                       loop (rows . (RUpd (fromIntegral cnt) :))
+                  else pure (rows [RUpd (fromIntegral cnt)])
+
+                else do
+                  retcode <- odbc_SQLMoreResults dbc stmt
+                  if retcode == sql_success || retcode == sql_success_with_info then do
+                       loop (rows . (RDdl:))
+                  else pure (rows [RDdl])
+
+             else do  -- has cols so definitely a data resultset
+                  let loopinner datarows = do
+                       retcode0 <- odbc_SQLFetch dbc stmt
+
+                       if | retcode0 == sql_no_data -> do
+                             retcode <- odbc_SQLMoreResults dbc stmt
+                             if retcode == sql_success || retcode == sql_success_with_info
+                                then loop (rows . (RData types (datarows []):))
+                                else pure (rows [RData types (datarows [])])
+
+                          | retcode0 == sql_success || retcode0 == sql_success_with_info -> do
+                              fields <- sequence (zipWith (getData dbc stmt) [SQLUSMALLINT 1 ..] types)
+                              loopinner (datarows . (fields :))
+
+                          | otherwise ->
+                             throwIO
+                              (UnsuccessfulReturnCode
+                                 "odbc_SQLFetch"
+                                 (coerce retcode0)
+                                 "Unexpected return code")
+                  loopinner id
+
+  loop id
 
 -- | Fetch all rows from a statement.
 fetchStatementRows :: Ptr EnvAndDbc -> SQLHSTMT s -> IO [[Value]]
@@ -446,16 +717,19 @@ describeColumn dbPtr stmt i =
                                        sizep
                                        digitsp
                                        nullp)
-                                  typ <- peek typep
-                                  size <- peek sizep
-                                  digits <- peek digitsp
-                                  isnull <- peek nullp
+                                  SQLSMALLINT typ <- peek typep
+                                  SQLULEN size <- peek sizep
+                                  SQLSMALLINT nmlen <- peek namelenp
+                                  SQLSMALLINT digits <- peek digitsp
+                                  SQLSMALLINT isnull <- peek nullp
+                                  name <- T.fromPtr namep (fromIntegral nmlen)
                                   evaluate
                                     Column
-                                    { columnType = typ
-                                    , columnSize = size
-                                    , columnDigits = digits
-                                    , columnNull = isnull
+                                    { columnName = name
+                                    , columnType = fromIntegral typ
+                                    , columnSize = fromIntegral size
+                                    , columnDigits = fromIntegral digits
+                                    , columnNull = isnull /= 0
                                     }))))))))
 
 -- | Pull data for the given column.
@@ -649,7 +923,7 @@ getData dbc stmt i col =
             (let SQLSMALLINT n = colType
              in n))
   where
-    colType = columnType col
+    colType = fromIntegral $ columnType col
 
 -- | Get a GUID as a binary value.
 getGuid :: Ptr EnvAndDbc -> SQLHSTMT s -> SQLUSMALLINT -> IO Value
@@ -736,6 +1010,29 @@ getTextData dbc stmt column = do
                 (coerce bufferp)
                 (SQLLEN (fromIntegral allocBytes)))
            t <- T.fromPtr bufferp (fromIntegral (div availableBytes 2))
+           let !v = TextValue t
+           pure v)
+
+getStringData :: Ptr EnvAndDbc -> SQLHSTMT s -> SQLUSMALLINT -> IO Value
+getStringData dbc stmt column = do
+  mavailableChars <- getSize dbc stmt sql_c_char column
+  case mavailableChars of
+    Just 0 -> pure (TextValue mempty)
+    Nothing -> pure NullValue
+    Just availableBytes -> do
+      let allocBytes = availableBytes + 2
+      withMallocBytes
+        (fromIntegral allocBytes)
+        (\bufferp -> do
+           void
+             (getTypedData
+                dbc
+                stmt
+                sql_c_char
+                column
+                (coerce bufferp)
+                (SQLLEN (fromIntegral allocBytes)))
+           t <- T.fromPtr bufferp (fromIntegral availableBytes)
            let !v = TextValue t
            pure v)
 
@@ -901,6 +1198,32 @@ foreign import ccall "odbc odbc_AllocEnvAndDbc"
 foreign import ccall "odbc &odbc_FreeEnvAndDbc"
   odbc_FreeEnvAndDbc :: FunPtr (Ptr EnvAndDbc -> IO ())
 
+foreign import ccall "odbc odbc_SQLPrepare"
+  odbc_SQLPrepare :: Ptr EnvAndDbc -> Ptr SQLCHAR -> SQLINTEGER -> IO RETCODE
+
+foreign import ccall "odbc odbc_GBCommit"
+  odbc_GBCommit :: Ptr EnvAndDbc -> IO RETCODE
+
+foreign import ccall "odbc odbc_GBRollback"
+  odbc_GBRollback :: Ptr EnvAndDbc -> IO RETCODE
+
+foreign import ccall "odbc odbc_GBSetAutoCommitOn"
+  odbc_GBSetAutoCommitOn :: Ptr EnvAndDbc -> IO RETCODE
+
+foreign import ccall "odbc odbc_GBSetAutoCommitOff"
+  odbc_GBSetAutoCommitOff :: Ptr EnvAndDbc -> IO RETCODE
+
+foreign import ccall "odbc odbc_GBGetAutoCommitState"
+  odbc_GBGetAutoCommitState :: Ptr EnvAndDbc -> Ptr SQLINTEGER -> IO RETCODE
+
+foreign import ccall "odbc odbc_SQLSetConnectAttr"
+  odbc_SQLSetConnectAttr :: Ptr EnvAndDbc -> SQLINTEGER -> SQLPOINTER -> SQLINTEGER -> IO RETCODE
+
+foreign import ccall "odbc odbc_SQLGetConnectAttr"
+  odbc_SQLGetConnectAttr :: Ptr EnvAndDbc -> SQLINTEGER -> SQLPOINTER -> SQLINTEGER -> Ptr SQLINTEGER -> IO RETCODE
+
+
+
 foreign import ccall "odbc odbc_SQLDriverConnect"
   odbc_SQLDriverConnect :: Ptr EnvAndDbc -> Ptr SQLCHAR -> SQLSMALLINT -> IO RETCODE
 
@@ -924,6 +1247,12 @@ foreign import ccall "odbc odbc_SQLMoreResults"
 
 foreign import ccall "odbc odbc_SQLNumResultCols"
   odbc_SQLNumResultCols :: SQLHSTMT s -> Ptr SQLSMALLINT -> IO RETCODE
+
+foreign import ccall "odbc odbc_SQLRowCount"
+  odbc_SQLRowCount :: SQLHSTMT s -> Ptr SQLLEN -> IO RETCODE
+
+foreign import ccall "odbc odbc_SQLEndTran"
+  odbc_SQLEndTran :: SQLSMALLINT -> SQLHSTMT s -> SQLSMALLINT -> IO RETCODE
 
 foreign import ccall "odbc odbc_SQLGetData"
  odbc_SQLGetData
@@ -1019,8 +1348,8 @@ sql_no_total = (-4)
 --------------------------------------------------------------------------------
 -- SQL data type constants
 
--- sql_unknown_type :: SQLSMALLINT
--- sql_unknown_type = 0
+sql_unknown_type :: SQLSMALLINT
+sql_unknown_type = 0
 
 sql_char :: SQLSMALLINT
 sql_char = 1
@@ -1116,8 +1445,8 @@ sql_guid = (-11)
 sql_c_wchar :: SQLCTYPE
 sql_c_wchar = coerce sql_wchar
 
--- sql_c_char :: SQLCTYPE
--- sql_c_char = coerce sql_char
+sql_c_char :: SQLCTYPE
+sql_c_char = coerce sql_char
 
 sql_c_binary :: SQLCTYPE
 sql_c_binary = coerce sql_binary

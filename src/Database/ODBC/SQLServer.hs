@@ -1,4 +1,5 @@
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE CPP #-}
@@ -8,6 +9,10 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | SQL Server database API.
 
@@ -19,13 +24,31 @@ module Database.ODBC.SQLServer
     -- $usage
 
     -- * Connect/disconnect
-    Internal.connect
+--    Internal.connect
+    connect
+  , withConnection
   , Internal.close
   , Internal.Connection
+  , Internal.AutoCommit(..)
+  , Internal.Column(..)
+  , Internal.commit
+  , Internal.rollback
 
     -- * Executing queries
   , exec
   , query
+
+  , queryAll'
+  , queryAll
+  , queryAllList
+  , queryAllMap
+  , queryAllList'
+  , queryAllMap'
+
+  , Internal.ResultSet(..)
+  , Internal.ResultSets
+  , Internal.RMeta
+
   , Value(..)
   , Query
   , ToSql(..)
@@ -49,6 +72,24 @@ module Database.ODBC.SQLServer
 
    -- * Debugging
   , renderQuery
+
+  , buildSqlQueryFromList
+  , buildSqlQueryFromListHelper
+  , partListParseOnly
+  , PartList (..)
+  , paramCountList
+
+  , buildSqlQueryFromMap
+  , buildSqlQueryFromMapHelper
+  , partMapParseOnly
+  , PartMap (..)
+  , Part (..)
+  , paramCountMap
+
+  , renderValue
+  , renderParts
+  , renderPart
+
   ) where
 
 
@@ -82,6 +123,16 @@ import           Formatting ((%))
 import           Formatting.Time as Formatting
 import           GHC.Generics
 import           Text.Printf
+import qualified Data.Map.Strict as M
+import Data.Map.Strict (Map)
+import qualified Data.Set as Set
+import Data.Set (Set)
+import           qualified Text.Parsec as P
+import           qualified Text.Parsec.String as P
+import Control.Applicative
+import Control.Monad
+import qualified UnliftIO as U
+import Control.Arrow (first)
 
 #if MIN_VERSION_base(4,9,0)
 import           GHC.TypeLits
@@ -379,6 +430,25 @@ instance ToSql Smalldatetime where
 --------------------------------------------------------------------------------
 -- Top-level functions
 
+connect ::
+     MonadIO m
+  => Internal.AutoCommit
+  -> Text -- ^ An ODBC connection string.
+  -> m Connection
+connect = \case
+             Internal.Auto -> Internal.connectAuto
+             Internal.Manual -> Internal.connectManual
+
+
+withConnection :: MonadUnliftIO m
+            => Internal.AutoCommit
+            -> Text  -- ^ An ODBC connection string.
+            -> (Connection -> m a) -- ^ Program that uses the ODBC connection.
+            -> m a
+withConnection = \case
+             Internal.Auto -> Internal.withConnectionAuto
+             Internal.Manual -> Internal.withConnectionManual
+
 -- | Query and return a list of rows.
 --
 -- The @row@ type is inferred based on use or type-signature. Examples
@@ -395,6 +465,69 @@ query c (Query ps) = do
   case mapM fromRow rows of
     Right rows' -> pure rows'
     Left e -> liftIO (throwIO (Internal.DataRetrievalError e))
+
+-- | Query and return a list of rows.
+--
+-- The @row@ type is inferred based on use or type-signature. Examples
+-- might be @(Int, Text, Bool)@ for concrete types, or @[Maybe Value]@
+-- if you don't know ahead of time how many columns you have and their
+-- type. See the top section for example use.
+queryAll :: (MonadIO m, MonadUnliftIO m)
+  => Connection -- ^ A connection to the database.
+  -> Query -- ^ SQL query.
+  -> m Internal.ResultSets
+queryAll c (Query ps) = do
+  queryAll' c (renderParts (toList ps))
+
+queryAll' :: (MonadIO m, MonadUnliftIO m)
+  => Connection -- ^ A connection to the database.
+  -> Text -- ^ SQL query.
+  -> m Internal.ResultSets
+queryAll' c t = do
+  lr <- U.try $ Internal.queryAll c t
+  case lr of
+    Left (e :: Internal.ODBCException) -> liftIO $ throwIO $ Internal.SqlFailedError t e
+    Right ret -> pure ret
+
+queryAllList' :: MonadIO m
+  => Connection
+  -> [PartList]
+  -> [Value]
+  -> m Internal.ResultSets
+queryAllList' c ps vs = do
+  case buildSqlQueryFromListHelper vs ps of
+    Left e -> liftIO (throwIO (Internal.ParameterMismatch e))
+    Right t -> Internal.queryAll c t
+
+queryAllMap' :: (MonadIO m, MonadUnliftIO m)
+  => Connection
+  -> [PartMap]
+  -> Map String Value
+  -> m Internal.ResultSets
+queryAllMap' c ps vs = do
+  case buildSqlQueryFromMapHelper vs ps of
+    Left e -> liftIO (throwIO (Internal.ParameterMismatch e))
+    Right t -> queryAll' c t
+
+queryAllList :: MonadIO m
+  => Connection
+  -> Text
+  -> [Value]
+  -> m Internal.ResultSets
+queryAllList c s vs = do
+  case partListParseOnly s of
+    Left e -> liftIO (throwIO (Internal.ParseSqlError e))
+    Right (_, ps) -> queryAllList' c ps vs
+
+queryAllMap :: (MonadIO m, MonadUnliftIO m)
+  => Connection
+  -> Text
+  -> Map String Value
+  -> m Internal.ResultSets
+queryAllMap c s vs = do
+  case partMapParseOnly s of
+    Left e -> liftIO (throwIO (Internal.ParseSqlError e))
+    Right (_,ps) -> queryAllMap' c ps vs
 
 -- | Render a query to a plain text string. Useful for debugging and
 -- testing.
@@ -451,7 +584,8 @@ renderValue :: Value -> Text
 renderValue =
   \case
     NullValue -> "NULL"
-    TextValue t -> "(N'" <> T.concatMap escapeChar t <> "')"
+    TextValue t -> "'" <> T.concatMap escapeChar t <> "'"
+--    TextValue t -> "(N'" <> T.concatMap escapeChar t <> "')"  -- deathly slow on oracle: may need another type? or just use bytestring
     BinaryValue (Internal.Binary bytes) ->
       "0x" <>
       T.concat
@@ -517,3 +651,96 @@ escapeChar ch =
 -- on. Everything else is escaped.
 allowedChar :: Char -> Bool
 allowedChar c = (isAlphaNum c && isAscii c) || elem c (" ,.-_" :: [Char])
+
+--------------------------------------
+
+
+data PartMap
+    = SqlPartMap !Text
+    | ParamNameMap !String
+    deriving (Show, Eq)
+
+paramCountMap :: [PartMap] -> Int
+paramCountMap  = sum . map (\case
+                           ParamNameMap {} -> 1
+                           SqlPartMap {} -> 0)
+
+paramCountList :: [PartList] -> Int
+paramCountList  = sum . map (\case
+                           ParamNameList {} -> 1
+                           SqlPartList {} -> 0)
+
+partMapParser :: P.Parser (Int, [PartMap])
+partMapParser = first sum . unzip <$> P.many1 (self <|> param <|> part)
+  where
+    self = P.try ((0, SqlPartMap "$") <$ P.string "$$") P.<?> "escaped dollar $$"
+    param =
+      (P.char '$' *>
+       ((1,) . ParamNameMap <$>
+        (P.many1 (P.satisfy isAlphaNum)) P.<?> "variable name (alpha-numeric only)")) P.<?>
+      "parameter (e.g. $foo123)"
+    part = ((0,) . SqlPartMap . T.pack <$> P.many1 (P.satisfy (/= '$'))) P.<?> "SQL code"
+
+data PartList
+    = SqlPartList !Text
+    | ParamNameList
+    deriving (Show, Eq)
+
+partListParser :: P.Parser (Int, [PartList])
+partListParser = first sum . unzip <$> P.many1 (self <|> param <|> part)
+  where
+    self = P.try ((0,SqlPartList "?") <$ P.string "??") P.<?> "escaped questionmark ??"
+    param = (1,ParamNameList) <$ P.char '?'
+    part = ((0,) . SqlPartList . T.pack <$> P.many1 (P.satisfy (/= '?'))) P.<?> "SQL code"
+
+partListParseOnly :: Text -> Either String (Int, [PartList])
+partListParseOnly (T.unpack -> input) = do
+  case P.parse partListParser "<partListParseOnly>" input of
+    Left err    -> Left $ "Parse error in SQL: " <> show err <> " sql=" <> input
+    Right parts -> pure parts
+
+partMapParseOnly :: Text -> Either String (Int, [PartMap])
+partMapParseOnly (T.unpack -> input) = do
+  case P.parse partMapParser "<partMapParseOnly>" input of
+    Left err    -> Left $ "Parse error in SQL: " <> show err <> " sql=" <> input
+    Right parts -> pure parts
+
+buildSqlQueryFromMap :: Text -> Map String Value -> Either String Text
+buildSqlQueryFromMap input m =
+  partMapParseOnly input >>= buildSqlQueryFromMapHelper m . snd
+
+buildSqlQueryFromMapHelper :: Map String Value -> [PartMap] -> Either String Text
+buildSqlQueryFromMapHelper m ps =
+  case traverse go ps of
+    Left e -> Left e
+    Right (unzip -> (a,b)) ->
+      let xs :: Set String
+          xs = mconcat a
+          ks :: Set String
+          ks = M.keysSet m
+      in if xs /= ks then Left $ "buildSqlFromMap: not all keys were used up map keys=" ++ show ks ++ " used=" ++ show xs
+         else pure $ mconcat b
+  where
+    go :: PartMap -> Either String (Set String, Text)
+    go (SqlPartMap str) = pure (mempty,str)
+    go (ParamNameMap name) =
+      case M.lookup name m of
+        Nothing -> Left $ "buildSqlFromMap: key not found [" ++ name ++ "] in map=" ++ show m
+        Just v -> pure (Set.singleton name, renderValue v)
+
+buildSqlQueryFromList :: Text -> [Value] -> Either String Text
+buildSqlQueryFromList input m = do
+  partListParseOnly input >>= buildSqlQueryFromListHelper m . snd
+
+buildSqlQueryFromListHelper  :: [Value] -> [PartList] -> Either String Text
+buildSqlQueryFromListHelper vs ps =
+  let ret = foldM (\(x,out) -> \case
+                        SqlPartList str -> pure (x,out <> str)
+                        ParamNameList -> case x of
+                                           [] -> Left $ "buildSqlFromList: ran out of args: ps=" ++ show (length ps) ++ " vs=" ++ show (length vs) ++ " ps=" ++ show ps ++ " vs=" ++ show vs
+                                           v:zs -> pure (zs, out <> renderValue v)
+               ) (vs,mempty) ps
+  in case ret of
+    Left e -> Left e
+    Right ([], t) -> pure t
+    Right (o, _) -> Left $ "buildSqlFromList: too many args found: ps=" ++ show (length ps) ++ " vs=" ++ show (length vs) ++ " ps=" ++ show ps ++ " vs=" ++ show vs ++ " leftovers=" ++ show o

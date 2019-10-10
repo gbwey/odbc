@@ -116,6 +116,43 @@ void odbc_FreeEnvAndDbc(EnvAndDbc *envAndDbc){
   free(envAndDbc);
 }
 
+RETCODE odbc_GBSetAutoCommitOn(EnvAndDbc *envAndDbc){
+  RETCODE r = SQLSetConnectAttr(*(envAndDbc->dbc), SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_ON, SQL_NTS); /* 1, -5); */
+  if (r == SQL_ERROR) odbc_ProcessLogMessages(envAndDbc, SQL_HANDLE_DBC, *(envAndDbc->dbc), "odbc_GBSetAutoCommitOn", FALSE);
+  return r;
+}
+
+RETCODE odbc_GBSetAutoCommitOff(EnvAndDbc *envAndDbc){
+  RETCODE r = SQLSetConnectAttr(*(envAndDbc->dbc), SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_OFF, SQL_NTS); /* 0, -5); */
+  if (r == SQL_ERROR) odbc_ProcessLogMessages(envAndDbc, SQL_HANDLE_DBC, *(envAndDbc->dbc), "odbc_GBSetAutoCommitOff", FALSE);
+  return r;
+}
+
+RETCODE odbc_GBGetAutoCommitState(EnvAndDbc *envAndDbc, SQLINTEGER *autoCommitState){
+  RETCODE r = SQLGetConnectAttr(*(envAndDbc->dbc), SQL_ATTR_AUTOCOMMIT, autoCommitState, 0, NULL);
+  if (r == SQL_ERROR) odbc_ProcessLogMessages(envAndDbc, SQL_HANDLE_DBC, *(envAndDbc->dbc), "odbc_GBGetAutoCommit", FALSE);
+  return r;
+}
+
+RETCODE odbc_SQLSetConnectAttr(EnvAndDbc *envAndDbc, SQLINTEGER attr, SQLPOINTER valptr, SQLINTEGER slen){
+  RETCODE r = SQLSetConnectAttr(*(envAndDbc->dbc), attr, valptr, slen);
+  if (r == SQL_ERROR) odbc_ProcessLogMessages(envAndDbc, SQL_HANDLE_DBC, *(envAndDbc->dbc), "odbc_SQLSetConnectAttr", FALSE);
+  return r;
+}
+
+RETCODE odbc_SQLGetConnectAttr(EnvAndDbc *envAndDbc, SQLINTEGER attr, SQLPOINTER valptr, SQLINTEGER bufferlen, SQLINTEGER * slenptr){
+  RETCODE r = SQLGetConnectAttr(*(envAndDbc->dbc), attr, valptr, bufferlen, slenptr);
+  if (r == SQL_ERROR) odbc_ProcessLogMessages(envAndDbc, SQL_HANDLE_DBC, *(envAndDbc->dbc), "odbc_SQLGetConnectAttr", FALSE);
+  return r;
+}
+
+
+void odbc_GBCommit(EnvAndDbc *envAndDbc){
+  SQLEndTran(SQL_HANDLE_DBC, *(envAndDbc->dbc), SQL_COMMIT);
+}
+void odbc_GBRollback(EnvAndDbc *envAndDbc){
+  SQLEndTran(SQL_HANDLE_DBC, *(envAndDbc->dbc), SQL_ROLLBACK);
+}
 ////////////////////////////////////////////////////////////////////////////////
 // Connect/disconnect
 
@@ -228,6 +265,18 @@ SQLRETURN odbc_SQLDescribeColW(
 RETCODE odbc_SQLNumResultCols(SQLHSTMT *hstmt, SQLSMALLINT *cols){
   return SQLNumResultCols(*hstmt, cols);
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// Get rows
+
+RETCODE odbc_SQLRowCount(SQLHSTMT *hstmt, SQLLEN *rowcount){
+  return SQLRowCount(*hstmt, rowcount);
+}
+
+RETCODE odbc_SQLEndTran(SQLSMALLINT htype, SQLHSTMT *hstmt, SQLSMALLINT completiontype){
+  return SQLEndTran(htype, *hstmt, completiontype);
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Logs

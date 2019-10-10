@@ -1,11 +1,12 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE BangPatterns #-}
 module Database.ODBC.TH
+{-
   ( sql
   , sqlFile
   , partsParser
   , Part(..)
-  ) where
+  ) -} where
 
 import           Control.DeepSeq
 import           Data.Char

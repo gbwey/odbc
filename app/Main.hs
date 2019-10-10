@@ -18,7 +18,7 @@ main = do
   args <- getArgs
   case args of
     [connStr] -> do
-      conn <- ODBC.connect (T.pack connStr)
+      conn <- ODBC.connectAuto (T.pack connStr)
       repl conn
     _ -> error "usage: <connection string>"
 
