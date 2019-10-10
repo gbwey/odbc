@@ -33,6 +33,7 @@ char *odbc_error(EnvAndDbc *envAndDbc){
 
 void odbc_ProcessLogMessages(EnvAndDbc *envAndDbc, SQLSMALLINT plm_handle_type, SQLHANDLE plm_handle, char *logstring, int ConnInd);
 
+
 ////////////////////////////////////////////////////////////////////////////////
 // Alloc/dealloc env
 
@@ -81,6 +82,7 @@ void odbc_SQLFreeDbc(SQLHDBC *hdbc){
     free(hdbc);
   }
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Allocate/dealloc env-and-database
@@ -257,6 +259,10 @@ SQLRETURN odbc_SQLDescribeColW(
     ColumnSizePtr,
     DecimalDigitsPtr,
     NullablePtr);
+}
+
+RETCODE odbc_SQLPrepare(SQLHSTMT *hstmt, SQLCHAR *statementtext, SQLINTEGER tlen){
+  return SQLPrepare(*hstmt, statementtext, tlen);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
