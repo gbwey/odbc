@@ -35,6 +35,7 @@ module Database.ODBC.Internal
   , query
   , queryAll
   , Value(..)
+  , SqlValue
   , Binary(..)
     -- * Streaming results
   , stream
@@ -104,6 +105,7 @@ data ODBCException
   deriving (Typeable, Show, Eq)
 instance Exception ODBCException
 
+type SqlValue = Value
 -- | A value used for input/output with the database.
 data Value
   = TextValue !Text

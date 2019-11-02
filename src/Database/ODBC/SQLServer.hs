@@ -50,6 +50,7 @@ module Database.ODBC.SQLServer
   , Internal.RMeta
 
   , Value(..)
+  , SqlValue
   , Query
   , ToSql(..)
   , rawUnescapedText
@@ -116,7 +117,7 @@ import qualified Data.Text.Lazy as LT
 import           Data.Time
 import           Data.Word
 import           Database.ODBC.Conversion
-import           Database.ODBC.Internal (Value(..), Connection)
+import           Database.ODBC.Internal (SqlValue, Value(..), Connection)
 import qualified Database.ODBC.Internal as Internal
 import qualified Formatting
 import           Formatting ((%))
